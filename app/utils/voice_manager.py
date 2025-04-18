@@ -6,19 +6,16 @@ import torchaudio
 import shutil
 from typing import Dict, List, Optional, Any
 
+# Import persistent directory constants
+from app.constants import VOICE_REFERENCES_DIR, VOICE_PROFILES_DIR, VOICE_MEMORIES_DIR, VOICE_BACKUPS_DIR
+
 logger = logging.getLogger(__name__)
 
-# Define persistent paths
-VOICE_REFERENCES_DIR = "/app/voice_references"
-VOICE_PROFILES_DIR = "/app/voice_profiles"
-VOICE_MEMORIES_DIR = "/app/voice_memories"
-
 # Ensure directories exist
-os.makedirs(VOICE_REFERENCES_DIR, exist_ok=True)
-os.makedirs(VOICE_PROFILES_DIR, exist_ok=True)
-os.makedirs(VOICE_MEMORIES_DIR, exist_ok=True)
+for _d in (VOICE_REFERENCES_DIR, VOICE_PROFILES_DIR, VOICE_MEMORIES_DIR):
+    os.makedirs(_d, exist_ok=True)
 
-def backup_voice_data(backup_dir: str = "/app/voice_backups"):
+def backup_voice_data(backup_dir: str = VOICE_BACKUPS_DIR):
     """Create a backup of all voice data."""
     os.makedirs(backup_dir, exist_ok=True)
     timestamp = torch.datetime.now().strftime("%Y%m%d_%H%M%S")

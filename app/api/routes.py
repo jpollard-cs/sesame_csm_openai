@@ -135,7 +135,7 @@ async def generate_speech(
             # Use voice context from memory if enabled
             if hasattr(request.app.state, "voice_memory_enabled") and request.app.state.voice_memory_enabled:
                 from app.voice_memory import get_voice_context
-                context = get_voice_context(voice, torch.device(request.app.state.device))
+                context = get_voice_context(voice, request.app.state.device)
             else:
                 context = []
             

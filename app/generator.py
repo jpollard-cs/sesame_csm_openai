@@ -11,6 +11,7 @@ from tokenizers.processors import TemplateProcessing
 from app.models import Segment
 from app.text_normalizer import clean_text_for_tts
 from app.text_normalizer import TextNormalizer
+from app.utils.torch_utils import get_device, safely_move_to_device
 
 
 # Set up logging
@@ -66,39 +67,39 @@ class Generator:
         self._model.setup_caches(1)
         self._text_tokenizer = load_llama3_tokenizer()
         device = next(model.parameters()).device
-        # Load Mimi codec for audio tokenization
+        # Load Mimi codec for audio tokenization with CPU fallback
+        logger.info("Loading Mimi audio codec...")
+        from huggingface_hub import hf_hub_download
+        # Determine Mimi loader
         try:
-            logger.info("Loading Mimi audio codec...")
-            from huggingface_hub import hf_hub_download
-            # First try to import from moshi
+            from moshi.models import loaders
+            DEFAULT_REPO = loaders.DEFAULT_REPO
+            MIMI_NAME = loaders.MIMI_NAME
+            get_mimi = loaders.get_mimi
+        except ImportError:
+            logger.warning("moshi.models.loaders not found, using fallback loader")
+            DEFAULT_REPO = "kyutai/mimi"
+            MIMI_NAME = "mimi-december.pt"
+            def get_mimi(checkpoint_path, device):
+                from moshi.models import MiMiModule
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                return MiMiModule.init_from_checkpoint(checkpoint, device=device)
+        mimi_weight = hf_hub_download(DEFAULT_REPO, MIMI_NAME)
+        # Try primary device then CPU
+        self._audio_tokenizer = None
+        self.sample_rate = 24000
+        for attempt_device in (device, torch.device("cpu")):
             try:
-                from moshi.models import loaders
-                DEFAULT_REPO = loaders.DEFAULT_REPO
-                MIMI_NAME = loaders.MIMI_NAME
-                get_mimi = loaders.get_mimi
-            except ImportError:
-                logger.warning("moshi.models.loaders not found, using fallback")
-                # Fallback values if moshi.models.loaders is not available
-                DEFAULT_REPO = "kyutai/mimi"
-                MIMI_NAME = "mimi-december.pt"
-                # Fallback function to load mimi
-                def get_mimi(checkpoint_path, device):
-                    from moshi.models.vqvae_model import MiMiModule
-                    checkpoint = torch.load(checkpoint_path, map_location=device)
-                    model = MiMiModule.init_from_checkpoint(checkpoint, device=device)
-                    return model
-            mimi_weight = hf_hub_download(DEFAULT_REPO, MIMI_NAME)
-            mimi = get_mimi(mimi_weight, device=device)
-            mimi.set_num_codebooks(32)
-            self._audio_tokenizer = mimi
-            self.sample_rate = mimi.sample_rate
-            logger.info(f"Mimi codec loaded successfully with sample rate {self.sample_rate}")
-        except Exception as e:
-            logger.error(f"Error loading Mimi codec: {e}")
-            self._audio_tokenizer = None
-            self.sample_rate = 24000  # Default sample rate
-            logger.warning(f"Using fallback sample rate: {self.sample_rate}")
-            raise RuntimeError(f"Failed to load Mimi codec: {e}")
+                mimi = get_mimi(mimi_weight, device=attempt_device)
+                mimi.set_num_codebooks(32)
+                self._audio_tokenizer = mimi
+                self.sample_rate = mimi.sample_rate
+                logger.info(f"Mimi codec loaded successfully with sample rate {self.sample_rate} on {attempt_device}")
+                break
+            except Exception as e:
+                logger.error(f"Error loading Mimi codec on {attempt_device}: {e}")
+        if self._audio_tokenizer is None:
+            logger.warning(f"Mimi codec not loaded, using fallback sample rate {self.sample_rate}")
         try:
             self._watermarker = load_watermarker(device=device)
             logger.info("Watermarker loaded successfully")
@@ -112,6 +113,26 @@ class Generator:
             torch.backends.cudnn.benchmark = True
             torch.cuda.empty_cache()
             logger.info("CUDA optimizations enabled")
+        # Wrap Mimi decode to fallback on CPU for MPS placeholder storage errors
+        elif self._audio_tokenizer is not None:
+            try:
+                orig_decode = self._audio_tokenizer.decode
+                def decode_with_fallback(codes):
+                    try:
+                        return orig_decode(codes)
+                    except RuntimeError as e:
+                        # TODO Probbaly a better way to do this
+                        if self.device.type == 'mps' and 'Placeholder storage' in str(e):
+                            logger.warning("Mimi decode falling back to CPU due to MPS placeholder storage error")
+                            cpu_codes = codes.to('cpu')
+                            self._audio_tokenizer.to('cpu')
+                            audio = orig_decode(cpu_codes)
+                            return audio.to(self.device)
+                        else:
+                            raise
+                self._audio_tokenizer.decode = decode_with_fallback
+            except Exception as e:
+                logger.warning(f"Failed to wrap Mimi decode fallback: {e}")
             
     def _tokenize_text_segment(self, text: str, speaker: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize a text segment."""
@@ -139,13 +160,21 @@ class Generator:
         frame_tokens = []
         frame_masks = []
         # (K, T)
-        audio = audio.to(self.device)
+        # Send audio to the same device as the audio tokenizer (Mimi) to avoid dtype mismatches
+        try:
+            tokenizer_device = next(self._audio_tokenizer.parameters()).device
+        except Exception:
+            tokenizer_device = self.device
+        audio = audio.to(tokenizer_device)
         audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
-        # add EOS frame
-        eos_frame = torch.zeros(audio_tokens.size(0), 1).to(self.device)
+        # move tokens to model device for downstream processing before adding EOS
+        audio_tokens = audio_tokens.to(self.device)
+        # add EOS codebook column on model device
+        eos_frame = torch.zeros(audio_tokens.size(0), 1, dtype=audio_tokens.dtype, device=self.device)
         audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
-        audio_frame = torch.zeros(audio_tokens.size(1), 33).long().to(self.device)
-        audio_frame_mask = torch.zeros(audio_tokens.size(1), 33).bool().to(self.device)
+        # build audio frame and mask on model device
+        audio_frame = torch.zeros(audio_tokens.size(1), 33, dtype=torch.long, device=self.device)
+        audio_frame_mask = torch.zeros(audio_tokens.size(1), 33, dtype=torch.bool, device=self.device)
         audio_frame[:, :-1] = audio_tokens.transpose(0, 1)
         audio_frame_mask[:, :-1] = True
         frame_tokens.append(audio_frame)
@@ -239,10 +268,15 @@ class Generator:
         if self._audio_tokenizer is None:
             raise RuntimeError("Audio tokenizer not initialized")
         
-        # Start timing
-        start_time = torch.cuda.Event(enable_timing=True)
-        end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
+        # Start timing: use CUDA events on CUDA devices, otherwise fallback to time.time()
+        use_cuda_timing = self.device.type == 'cuda'
+        if use_cuda_timing:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            import time as _time
+            cpu_start_time = _time.time()
             
         self._model.reset_caches()
         
@@ -484,9 +518,12 @@ class Generator:
                 logger.warning(f"Error applying watermark: {e}. Continuing without watermark.")
         
         # Record execution time
-        end_time.record()
-        torch.cuda.synchronize()
-        execution_ms = start_time.elapsed_time(end_time)
+        if use_cuda_timing:
+            end_event.record()
+            torch.cuda.synchronize()
+            execution_ms = start_event.elapsed_time(end_event)
+        else:
+            execution_ms = (_time.time() - cpu_start_time) * 1000
         audio_length_ms = (audio.shape[0] / self.sample_rate) * 1000
         
         # Calculate real-time factor (RTF)
@@ -601,13 +638,13 @@ def _manual_device_map(model, state_dict, strategy="balanced"):
     logger.info(f"Model distributed across GPUs with {strategy} strategy")
     return model
 
-def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: str = None) -> Generator:
+def load_csm_1b(ckpt_path: str = "ckpt.pt", use_gpu: bool = True, device_map: str = None) -> Generator:
     """Load CSM-1B model and create generator with performance optimizations.
     
     Args:
         ckpt_path: Path to model checkpoint
-        device: Device to load model on ('cuda', 'cpu', or specific CUDA device)
-        device_map: Optional device mapping strategy ('auto', 'balanced', 'sequential', or None)
+        use_gpu: Whether to attempt using GPU (CUDA or MPS if available). Defaults to True.
+        device_map: Optional device mapping strategy for multi-GPU CUDA (\'auto\', \'balanced\', \'sequential\', or None). Ignored for MPS/CPU.
     
     Returns:
         Generator instance with optimized settings
@@ -615,8 +652,12 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
     try:
         # Import models module for CSM
         from app.torchtune_models import Model, ModelArgs
-        
-        # Create model
+
+        # Get the target device using the utility function
+        target_device = get_device(use_gpu=use_gpu)
+        logger.info(f"Target device selected: {target_device}")
+
+        # Create model args
         model_args = ModelArgs(
             backbone_flavor="llama-1B",
             decoder_flavor="llama-100M",
@@ -624,68 +665,72 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
             audio_vocab_size=2051,
             audio_num_codebooks=32,
         )
-        
+
         # Load model
-        logger.info(f"Loading CSM-1B model from {ckpt_path} with device={device}, device_map={device_map}")
-        
-        # Check for CUDA availability
-        cuda_available = device == "cuda" and torch.cuda.is_available()
-        
-        # Set up torch for optimized inference
-        if cuda_available:
+        logger.info(f"Loading CSM-1B model from {ckpt_path} for device={target_device}, device_map={device_map if target_device.type == 'cuda' else 'N/A'}")
+
+        # --- Device-Specific Optimizations ---
+        dtype = torch.float32 # Default precision
+
+        if target_device.type == 'cuda':
             # Check if we should enable TF32 (faster but slightly less precise)
             enable_tf32 = os.environ.get("ENABLE_TF32", "true").lower() == "true"
             if enable_tf32:
-                logger.info("Enabling TF32 for faster matrix multiplications")
+                logger.info("Enabling TF32 for faster matrix multiplications on CUDA")
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-            
+
             # Check for available precision modes
             use_bfloat16 = torch.cuda.is_bf16_supported()
-            use_float16 = not use_bfloat16 and torch.cuda.is_available()  # Fallback to float16
-            
+            # use_float16 = not use_bfloat16 # Float16 often has issues, prefer bfloat16 or float32
+
             if use_bfloat16:
                 dtype = torch.bfloat16
-                logger.info("Using bfloat16 precision for faster inference")
-            elif use_float16:
-                dtype = torch.float16
-                logger.info("Using float16 precision for faster inference")
+                logger.info("Using bfloat16 precision for faster inference on CUDA")
+            # elif use_float16:
+            #     dtype = torch.float16
+            #     logger.info("Using float16 precision for faster inference on CUDA")
             else:
-                dtype = torch.float32
-                logger.info("Using float32 precision (mixed precision not available)")
-            
+                logger.info("Using float32 precision on CUDA (bfloat16 not supported)")
+
             # Enable Flash Attention if available
             try:
                 import flash_attn
                 if os.environ.get("ENABLE_FLASH_ATTN", "true").lower() == "true":
-                    logger.info("Flash Attention detected - enabling for faster attention")
+                    logger.info("Flash Attention detected - enabling for faster attention on CUDA")
                     os.environ["PYTORCH_FLASH_ATTENTION_ENABLED"] = "1"
             except ImportError:
-                logger.info("Flash Attention not available (install flash-attn for faster inference)")
-        else:
-            # CPU-only mode
-            dtype = torch.float32
+                logger.info("Flash Attention not available (install flash-attn for faster inference on CUDA)")
+
+        elif target_device.type == 'mps':
+            # MPS specific setup (if any needed in the future)
+            # MPS supports bfloat16 on some devices, but float32 is generally safer
+            logger.info("Using float32 precision on MPS")
+            dtype = torch.float32 # Stick to float32 for broader MPS compatibility
+
+        else: # CPU
             logger.info("Using CPU mode with float32 precision")
-        
-        # Check for quantization
-        enable_quantization = os.environ.get("ENABLE_QUANTIZATION", "false").lower() == "true"
+            dtype = torch.float32
+
+        # Check for quantization (Currently CUDA only via bitsandbytes)
+        enable_quantization = os.environ.get("ENABLE_QUANTIZATION", "false").lower() == "true" and target_device.type == 'cuda'
         is_quantized = False
-        
-        # Check for multi-GPU setup
-        if device_map and torch.cuda.device_count() > 1:
-            logger.info(f"Using device_map={device_map} across {torch.cuda.device_count()} GPUs")
-            
+
+        # Check for multi-GPU setup (CUDA only)
+        if device_map and target_device.type == 'cuda' and torch.cuda.device_count() > 1:
+            logger.info(f"Using device_map={device_map} across {torch.cuda.device_count()} CUDA GPUs")
+
             # Create model with device map
             model = Model(model_args)
-            
-            # Load state dict
+
+            # Load state dict to CPU first for potential quantization/mapping
             state_dict = torch.load(ckpt_path, map_location='cpu')
-            
+
             # Try quantization before device mapping if enabled
-            if enable_quantization and cuda_available:
+            if enable_quantization:
                 try:
                     from bitsandbytes.nn import Linear8bitLt
-                    
+
                     def replace_with_8bit(model):
                         """Replace linear layers with 8-bit quantized versions"""
                         for name, module in model.named_modules():
@@ -698,137 +743,165 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", device_map: st
                                 child_name = name.rsplit('.', 1)[1] if '.' in name else name
                                 setattr(parent, child_name, Linear8bitLt.from_float(module))
                         return model
-                    
-                    logger.info("Applying 8-bit quantization to linear layers")
+
+                    logger.info("Applying 8-bit quantization to linear layers (CUDA only)")
                     model = replace_with_8bit(model)
                     is_quantized = True
                 except ImportError:
                     logger.warning("bitsandbytes not available, skipping quantization")
-            
+                except Exception as quant_error:
+                     logger.error(f"Quantization failed: {quant_error}, proceeding without quantization")
+
+
             # Apply device mapping
             if device_map == "auto":
                 # Use accelerate for automatic device mapping
                 try:
                     from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-                    
+
                     # Initialize empty model
                     with init_empty_weights():
                         empty_model = Model(model_args)
-                    
+                        if is_quantized: # Ensure empty model reflects potential quantization
+                             empty_model = replace_with_8bit(empty_model)
+
+
                     # Load and dispatch model across GPUs
-                    model = load_checkpoint_and_dispatch(
-                        empty_model, 
-                        ckpt_path, 
-                        device_map="auto",
-                        no_split_module_classes=["TransformerLayer"],
-                        # Offload CPU if very large model
-                        offload_folder="offload" if os.environ.get("OFFLOAD_TO_CPU", "false").lower() == "true" else None
-                    )
-                    logger.info("Model loaded with automatic device mapping")
+                    # Pass the already loaded state_dict instead of ckpt_path if quantized
+                    if is_quantized:
+                         # If quantized, we loaded the state dict already, need a way to load into mapped model
+                         # This might require custom loading with accelerate if quantized first
+                         logger.warning("Quantization before accelerate auto-mapping might require custom handling. Attempting manual mapping.")
+                         model = _manual_device_map(model, state_dict, "balanced") # Fallback
+                    else:
+                        model = load_checkpoint_and_dispatch(
+                            empty_model,
+                            ckpt_path,
+                            device_map="auto",
+                            no_split_module_classes=["TransformerLayer"],
+                            dtype=dtype, # Pass desired dtype
+                            # Offload CPU if very large model
+                            offload_folder="offload" if os.environ.get("OFFLOAD_TO_CPU", "false").lower() == "true" else None
+                        )
+                    logger.info("Model loaded with automatic device mapping (CUDA)")
                 except ImportError:
-                    logger.warning("accelerate package not found, falling back to manual device mapping")
+                    logger.warning("accelerate package not found, falling back to manual device mapping (CUDA)")
                     model = _manual_device_map(model, state_dict, "balanced")
                 except Exception as mapping_error:
-                    logger.error(f"Auto device mapping failed: {mapping_error}, falling back to manual")
+                    logger.error(f"Auto device mapping failed: {mapping_error}, falling back to manual (CUDA)")
                     model = _manual_device_map(model, state_dict, "balanced")
             else:
                 # Manual device mapping
+                logger.info(f"Applying manual device map: {device_map or 'balanced'} (CUDA)")
                 model = _manual_device_map(model, state_dict, device_map or "balanced")
+
+            # Safely move parts not handled by device_map (if any) - less likely needed here
+            # model = safely_move_to_device(model, target_device) # device_map should handle this
+
         else:
-            # Single GPU or CPU setup
-            
+            # Single device (CUDA, MPS, or CPU) setup
+            logger.info(f"Using single device setup on {target_device}")
+            model = None # Ensure model is reset before loading attempts
+
             # Try quantization before loading if enabled (GPU only)
-            if enable_quantization and cuda_available and not is_quantized:
+            if enable_quantization and not is_quantized: # Already checked target_device.type == 'cuda'
                 try:
-                    # First load to CPU for quantization
-                    model = Model(model_args).to("cpu")
+                    # Load to CPU first for quantization
+                    logger.info("Loading model to CPU for 8-bit quantization...")
+                    model_cpu = Model(model_args).to("cpu")
                     state_dict = torch.load(ckpt_path, map_location="cpu")
-                    model.load_state_dict(state_dict)
-                    
+                    model_cpu.load_state_dict(state_dict)
+
                     from bitsandbytes.nn import Linear8bitLt
-                    
-                    def replace_with_8bit(model):
-                        """Replace linear layers with 8-bit quantized versions"""
-                        for name, module in model.named_modules():
+
+                    def replace_with_8bit(model_to_quantize):
+                        # ... (quantization function - same as above, ensure it's defined or accessible)
+                        for name, module in model_to_quantize.named_modules():
                             if isinstance(module, torch.nn.Linear) and module.out_features > 256:
                                 parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
-                                parent = model
+                                parent = model_to_quantize
                                 if parent_name:
                                     for attr in parent_name.split('.'):
                                         parent = getattr(parent, attr)
                                 child_name = name.rsplit('.', 1)[1] if '.' in name else name
                                 setattr(parent, child_name, Linear8bitLt.from_float(module))
-                        return model
-                    
-                    logger.info("Applying 8-bit quantization to linear layers")
-                    model = replace_with_8bit(model)
-                    model = model.to(device=device)
+                        return model_to_quantize
+
+
+                    logger.info("Applying 8-bit quantization to linear layers (CUDA only)")
+                    model_quantized = replace_with_8bit(model_cpu)
+                    logger.info(f"Moving quantized model to {target_device}")
+                    model = safely_move_to_device(model_quantized, target_device)
                     is_quantized = True
+                    # Clear CPU model if needed
+                    del model_cpu
+                    if target_device.type == 'cuda': torch.cuda.empty_cache()
+
+
                 except ImportError:
                     logger.warning("bitsandbytes not available, loading without quantization")
-                    # Load the standard way
-                    model = Model(model_args).to(device=device, dtype=dtype)
-                    state_dict = torch.load(ckpt_path, map_location=device)
-                    model.load_state_dict(state_dict)
                 except Exception as quant_error:
                     logger.error(f"Quantization failed: {quant_error}, loading without quantization")
-                    # Load the standard way
-                    model = Model(model_args).to(device=device, dtype=dtype)
-                    state_dict = torch.load(ckpt_path, map_location=device)
-                    model.load_state_dict(state_dict)
-            else:
-                # Standard load without quantization
-                model = Model(model_args).to(device=device, dtype=dtype)
-                state_dict = torch.load(ckpt_path, map_location=device)
-                model.load_state_dict(state_dict)
-        
-        # Apply torch.compile if available (PyTorch 2.0+)
+
+            # Standard load if not quantized or quantization failed/skipped
+            if model is None: # Only load standard if model wasn't set by quantization block
+                 logger.info(f"Loading model directly to {target_device} with dtype {dtype}")
+                 # Instantiate model directly on target device if possible (reduces peak memory)
+                 try:
+                     # Try initializing directly on the target device (might fail for meta device init)
+                     model = Model(model_args, device=target_device, dtype=dtype)
+                     state_dict = torch.load(ckpt_path, map_location=target_device)
+                     model.load_state_dict(state_dict)
+                 except Exception as direct_init_error:
+                     logger.warning(f"Direct model initialization on {target_device} failed ({direct_init_error}), loading to CPU first.")
+                     model = Model(model_args).to('cpu') # Load on CPU first
+                     state_dict = torch.load(ckpt_path, map_location='cpu')
+                     model.load_state_dict(state_dict)
+                     logger.info(f"Moving model from CPU to {target_device} with dtype {dtype}")
+                     model.to(dtype=dtype) # Apply dtype before moving
+                     model = safely_move_to_device(model, target_device) # Move to target device
+
+
+        # Ensure model is correctly placed after all loading logic
+        if model is None:
+             raise RuntimeError("Model loading failed.")
+
+        # Verify final model device
+        final_device = next(model.parameters()).device
+        logger.info(f"Model loaded. Final device: {final_device}")
+        if final_device.type != target_device.type:
+             logger.warning(f"Model seems to be on {final_device} but target was {target_device}. Attempting final move.")
+             model = safely_move_to_device(model, target_device)
+
+
+        # Apply torch.compile if available (PyTorch 2.0+) and on CUDA
         compile_mode = os.environ.get("TORCH_COMPILE_MODE", "none")
-        if hasattr(torch, 'compile') and compile_mode != "none" and cuda_available:
+        if hasattr(torch, 'compile') and compile_mode != "none" and target_device.type == 'cuda':
             try:
-                logger.info(f"Using torch.compile with mode '{compile_mode}' for faster inference")
+                logger.info(f"Using torch.compile with mode '{compile_mode}' for faster inference (CUDA only)")
                 if compile_mode == "default":
                     model = torch.compile(model)
                 else:
                     model = torch.compile(model, mode=compile_mode)
             except Exception as compile_error:
-                logger.warning(f"Torch compile failed (requires PyTorch 2.0+): {compile_error}")
-        
-        # Try to optimize CUDA graphs for faster inference (advanced)
+                logger.warning(f"Torch compile failed (requires PyTorch 2.0+ on CUDA): {compile_error}")
+
+        # CUDA Graph setup (CUDA only)
         use_cuda_graphs = os.environ.get("USE_CUDA_GRAPHS", "false").lower() == "true"
-        if use_cuda_graphs and cuda_available and hasattr(torch.cuda, 'CUDAGraph'):
+        if use_cuda_graphs and target_device.type == 'cuda' and hasattr(torch.cuda, 'CUDAGraph'):
             try:
-                logger.info("Setting up CUDA graphs for repeated inference patterns")
+                logger.info("Setting up CUDA graphs for repeated inference patterns (CUDA only)")
                 # This requires custom integration inside the model's forward method
-                # Just flagging that CUDA graphs should be used
-                model.use_cuda_graphs = True
-            except Exception as cuda_graph_error:
-                logger.warning(f"CUDA graphs setup failed: {cuda_graph_error}")
-                model.use_cuda_graphs = False
-        
-        # Set optimal settings for CUDA context
-        if cuda_available:
-            # Set benchmark mode for hardware-specific optimizations
-            torch.backends.cudnn.benchmark = True
-            # Clean up CUDA cache before creating generator
-            torch.cuda.empty_cache()
-            # Ensure all CUDA work is completed to avoid launch delays
-            torch.cuda.synchronize()
-        
-        # Create generator
-        logger.info("Creating generator with optimized settings")
+                # For now, just log the intention. Real implementation needs model changes.
+                # Example: model = torch.cuda.make_graphed_callables(model, (sample_input,))
+            except Exception as graph_error:
+                logger.warning(f"CUDA Graph setup failed: {graph_error}")
+
+        # Create and return generator
         generator = Generator(model)
-        
-        # Log memory usage if on CUDA
-        if cuda_available:
-            memory_allocated = torch.cuda.memory_allocated() / (1024**3)
-            memory_reserved = torch.cuda.memory_reserved() / (1024**3)
-            logger.info(f"Model loaded, CUDA memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
-        
-        logger.info(f"Generator created successfully: precision={dtype}, quantized={is_quantized}")
+        logger.info("Generator created successfully.")
         return generator
+
     except Exception as e:
-        logger.error(f"Failed to load CSM-1B model: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Error loading CSM-1B model: {e}")
         raise

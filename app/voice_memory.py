@@ -8,12 +8,12 @@ import logging
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from app.models import Segment
+from app.constants import VOICE_MEMORIES_DIR
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
-# Path to store voice memories - use persistent location
-VOICE_MEMORIES_DIR = "/app/voice_memories"
+# Ensure the persistent directory for voice memories exists
 os.makedirs(VOICE_MEMORIES_DIR, exist_ok=True)
 
 @dataclass

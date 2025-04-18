@@ -18,6 +18,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import router as api_router
+from app.utils.torch_utils import get_device, detect_available_devices
+from app.constants import (
+    MODELS_DIR,
+    TOKENIZERS_DIR,
+    VOICE_MEMORIES_DIR,
+    VOICE_REFERENCES_DIR,
+    VOICE_PROFILES_DIR,
+    CLONED_VOICES_DIR,
+    AUDIO_CACHE_DIR,
+    STATIC_DIR,
+)
 
 # Setup logging
 os.makedirs("logs", exist_ok=True)
@@ -54,18 +65,21 @@ async def lifespan(app: FastAPI):
     app.state.logger = logger  # Make logger available to routes
     
     # Create necessary directories - use persistent locations
-    os.makedirs("/app/models", exist_ok=True)
-    os.makedirs("/app/tokenizers", exist_ok=True)
-    os.makedirs("/app/voice_memories", exist_ok=True)
-    os.makedirs("/app/voice_references", exist_ok=True)
-    os.makedirs("/app/voice_profiles", exist_ok=True)
-    os.makedirs("/app/cloned_voices", exist_ok=True)
-    os.makedirs("/app/audio_cache", exist_ok=True)
-    os.makedirs("/app/static", exist_ok=True)
+    for _d in (
+        MODELS_DIR,
+        TOKENIZERS_DIR,
+        VOICE_MEMORIES_DIR,
+        VOICE_REFERENCES_DIR,
+        VOICE_PROFILES_DIR,
+        CLONED_VOICES_DIR,
+        AUDIO_CACHE_DIR,
+        STATIC_DIR,
+    ):
+        os.makedirs(_d, exist_ok=True)
     
     # Set tokenizer cache
     try:
-        os.environ["TRANSFORMERS_CACHE"] = "/app/tokenizers"
+        os.environ["TRANSFORMERS_CACHE"] = TOKENIZERS_DIR
         logger.info(f"Set tokenizer cache to: {os.environ['TRANSFORMERS_CACHE']}")
     except Exception as e:
         logger.error(f"Error setting tokenizer cache: {e}")
@@ -79,37 +93,32 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Audio processing dependency missing: {e}. Some audio enhancements may not work.")
         logger.warning("Consider installing: pip install scipy soundfile")
     
-    # Check CUDA availability
-    cuda_available = torch.cuda.is_available()
-    if cuda_available:
-        device_count = torch.cuda.device_count()
-        device_name = torch.cuda.get_device_name(0) if device_count > 0 else "unknown"
-        logger.info(f"CUDA is available: {device_count} device(s). Using {device_name}")
-        # Report CUDA memory
-        if hasattr(torch.cuda, 'get_device_properties'):
-            total_memory = torch.cuda.get_device_properties(0).total_memory
-            logger.info(f"Total CUDA memory: {total_memory / (1024**3):.2f} GB")
-    else:
-        logger.warning("CUDA is not available. Using CPU (this will be slow)")
-    
-    # Determine device and device mapping
-    device = "cuda" if cuda_available else "cpu"
-    device_map = os.environ.get("CSM_DEVICE_MAP", None)  # Options: "auto", "balanced", "sequential"
-    if device_map and cuda_available:
-        if torch.cuda.device_count() > 1:
-            logger.info(f"Using device mapping strategy: {device_map} across {torch.cuda.device_count()} GPUs")
+    # Determine device and device mapping using torch_utils
+    use_gpu = os.environ.get("USE_GPU", "true").lower() == "true"
+    logger.info(f"Attempting to use GPU: {use_gpu}")
+    target_device = get_device(use_gpu=use_gpu)
+    app.state.device = target_device # Store the torch.device object
+    logger.info(f"Using device: {target_device}")
+
+    # Log available devices detected by torch_utils
+    detect_available_devices()
+
+    # Device mapping only applicable for multi-GPU CUDA
+    device_map = None
+    if target_device.type == 'cuda' and torch.cuda.device_count() > 1:
+        requested_map = os.environ.get("CSM_DEVICE_MAP") # Options: "auto", "balanced", "sequential"
+        if requested_map:
+            logger.info(f"Using device mapping strategy: {requested_map} across {torch.cuda.device_count()} GPUs")
+            device_map = requested_map
         else:
-            logger.info("Device mapping requested but only one GPU available, ignoring device_map")
-            device_map = None
-    else:
-        device_map = None
-    
-    logger.info(f"Using device: {device}")
-    app.state.device = device
+            logger.info("Multiple CUDA GPUs detected, but no CSM_DEVICE_MAP specified. Using single GPU.")
+    elif os.environ.get("CSM_DEVICE_MAP"):
+        logger.info(f"Device map requested but target device is {target_device} or only one CUDA GPU available. Ignoring device_map.")
+
     app.state.device_map = device_map
-    
+
     # Check if model file exists
-    model_path = os.path.join("/app/models", "ckpt.pt")
+    model_path = os.path.join(MODELS_DIR, "ckpt.pt")
     if not os.path.exists(model_path):
         # Try to download at runtime if not present
         logger.info("Model not found. Attempting to download...")
@@ -125,7 +134,7 @@ async def lifespan(app: FastAPI):
             model_path = hf_hub_download(
                 repo_id="sesame/csm-1b", 
                 filename="ckpt.pt", 
-                local_dir="/app/models"
+                local_dir=MODELS_DIR
             )
             download_time = time.time() - download_start
             logger.info(f"Model downloaded to {model_path} in {download_time:.2f} seconds")
@@ -138,12 +147,17 @@ async def lifespan(app: FastAPI):
         logger.info(f"Found existing model at {model_path}")
         logger.info(f"Model size: {os.path.getsize(model_path) / (1024 * 1024):.2f} MB")
     
-    # Load the model
+    # Load the model using the refactored function
     try:
         logger.info("Loading CSM-1B model...")
         load_start = time.time()
         from app.generator import load_csm_1b
-        app.state.generator = load_csm_1b(model_path, device, device_map)
+        # Pass use_gpu flag and device_map to the refactored load function
+        app.state.generator = load_csm_1b(
+            ckpt_path=model_path,
+            use_gpu=use_gpu,
+            device_map=device_map
+        )
         load_time = time.time() - load_start
         logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
         
@@ -178,15 +192,15 @@ async def lifespan(app: FastAPI):
         # Initialize voice cloning system
         try:
             logger.info("Initializing voice cloning system...")
-            from app.voice_cloning import VoiceCloner, CLONED_VOICES_DIR
-            # Update the cloned voices directory to use the persistent volume
-            app.state.cloned_voices_dir = "/app/cloned_voices"  # Store path in app state for access
-            os.makedirs(app.state.cloned_voices_dir, exist_ok=True)
-            CLONED_VOICES_DIR = app.state.cloned_voices_dir  # Update the module constant
-            
-            # Initialize the voice cloner with proper device
-            app.state.voice_cloner = VoiceCloner(app.state.generator, device=device)
-            
+            from app.voice_cloning import VoiceCloner
+            # The VoiceCloner uses the CLONED_VOICES_DIR constant from app.constants, no override needed
+
+            # Initialize the voice cloner with the actual torch.device object
+            app.state.voice_cloner = VoiceCloner(
+                generator=app.state.generator, # Pass the generator
+                device=target_device # Pass the torch.device object
+            )
+
             # Make sure existing voices are loaded
             app.state.voice_cloner._load_existing_voices()
             
@@ -266,7 +280,7 @@ async def lifespan(app: FastAPI):
         # Store model information for API endpoints
         app.state.model_info = {
             "name": "CSM-1B",
-            "device": device,
+            "device": target_device,
             "device_map": device_map,
             "sample_rate": app.state.sample_rate,
             "standard_voices": standard_voices,
@@ -362,11 +376,11 @@ async def lifespan(app: FastAPI):
         # Set up audio cache
         app.state.audio_cache_enabled = os.environ.get("ENABLE_AUDIO_CACHE", "true").lower() == "true"
         if app.state.audio_cache_enabled:
-            app.state.audio_cache_dir = "/app/audio_cache"
+            app.state.audio_cache_dir = AUDIO_CACHE_DIR
             logger.info(f"Audio cache enabled, cache dir: {app.state.audio_cache_dir}")
         
         # Log GPU utilization after model loading
-        if cuda_available:
+        if target_device.type == 'cuda':
             memory_allocated = torch.cuda.memory_allocated() / (1024**3)
             memory_reserved = torch.cuda.memory_reserved() / (1024**3)
             logger.info(f"GPU memory: {memory_allocated:.2f} GB allocated, {memory_reserved:.2f} GB reserved")
@@ -415,7 +429,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to set up scheduled tasks: {e}")
         
-        logger.info(f"CSM-1B TTS API is ready on {device} with sample rate {app.state.sample_rate}")
+        logger.info(f"CSM-1B TTS API is ready on {target_device} with sample rate {app.state.sample_rate}")
         logger.info(f"Standard voices: {standard_voices}")
         cloned_count = len(app.state.voice_cloner.list_voices()) if app.state.voice_cloning_enabled else 0
         logger.info(f"Cloned voices: {cloned_count}")
@@ -438,7 +452,7 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "generator") and app.state.generator is not None:
         try:
             # Clean up CUDA memory if available
-            if torch.cuda.is_available():
+            if target_device.type == 'cuda':
                 logger.info("Clearing CUDA cache")
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -497,11 +511,11 @@ app.add_middleware(
 )
 
 # Create static and other required directories
-os.makedirs("/app/static", exist_ok=True)
-os.makedirs("/app/cloned_voices", exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+os.makedirs(CLONED_VOICES_DIR, exist_ok=True)
 
 # Mount the static files directory
-app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Include routers
 app.include_router(api_router, prefix="/api/v1")
@@ -537,6 +551,9 @@ async def health_check(request: Request):
     model_status = "healthy" if hasattr(request.app.state, "generator") and request.app.state.generator is not None else "unhealthy"
     uptime = time.time() - getattr(request.app.state, "startup_time", time.time())
 
+    # Get device from app state
+    current_device = getattr(request.app.state, "device", torch.device("cpu")) # Get the stored torch.device object
+
     # Get voice information
     standard_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
     cloned_voices = []
@@ -549,7 +566,7 @@ async def health_check(request: Request):
     
     # Get CUDA memory stats if available
     cuda_stats = None
-    if torch.cuda.is_available():
+    if current_device.type == 'cuda': # Check the actual device type from state
         cuda_stats = {
             "allocated_gb": torch.cuda.memory_allocated() / (1024**3),
             "reserved_gb": torch.cuda.memory_reserved() / (1024**3)
@@ -558,7 +575,7 @@ async def health_check(request: Request):
     return {
         "status": model_status,
         "uptime": f"{uptime:.2f} seconds",
-        "device": getattr(request.app.state, "device", "unknown"),
+        "device": str(current_device), # Report the device from state as string
         "model": "CSM-1B",
         "standard_voices": standard_voices,
         "cloned_voices": cloned_voices,
@@ -588,13 +605,13 @@ async def version():
 @app.get("/voice-cloning", include_in_schema=False)
 async def voice_cloning_ui():
     """Voice cloning UI endpoint."""
-    return FileResponse("/app/static/voice-cloning.html")
+    return FileResponse(os.path.join(STATIC_DIR, "voice-cloning.html"))
 
 # Streaming demo endpoint
 @app.get("/streaming-demo", include_in_schema=False)
 async def streaming_demo():
     """Streaming TTS demo endpoint."""
-    return FileResponse("/app/static/streaming-demo.html")
+    return FileResponse(os.path.join(STATIC_DIR, "streaming-demo.html"))
 
 @app.get("/", include_in_schema=False)
 async def root():

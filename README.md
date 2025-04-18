@@ -451,3 +451,35 @@ This project is released under the MIT License. The CSM-1B model is subject to i
 ---
 
 Happy speech generating!
+
+## Running Locally on macOS (MPS)
+
+If you'd like to run the API natively on an Apple Silicon Mac using PyTorch's MPS backend (no Docker needed), follow these steps:
+
+1. Ensure Homebrew is installed
+2. Install system dependencies:
+   ```bash
+   brew update
+   brew install ffmpeg libsndfile python@3.10
+   ```
+3. Install Rust toolchain (required by `moshi`/`sphn`):
+   ```bash
+   curl https://sh.rustup.rs -sSf | sh -s -- -y
+   source $HOME/.cargo/env
+   ```
+4. Clone this repository (if you haven't already) and navigate into it:
+5. Create and activate a Python 3.10 virtual environment:
+   ```bash
+   python3.10 -m venv .venv
+   source .venv/bin/activate
+   ```
+6. Install Python dependencies (via script):
+   ```bash
+   chmod +x setup_macos.sh
+   ./setup_macos.sh
+   ```
+7. Start the API server:
+   ```bash
+   python -m app.main
+   ```
+8. The server listens on port 8000. Hit the endpoints at `http://localhost:8000`.

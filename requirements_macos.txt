@@ -8,8 +8,6 @@ torchaudio>=2.6.0
 transformers>=4.50.0
 tokenizers>=0.21.1
 sentencepiece>=0.2.0
-triton>=2.1.0; platform_system != "Windows" # Commented out for MPS compatibility
-triton-windows>=2.1.0; platform_system == "Windows" # Commented out for MPS compatibility
 torchao>=0.10.0
 torchtune>=0.6.1
 numpy>=2.2.4

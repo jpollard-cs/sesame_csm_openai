@@ -22,12 +22,12 @@ from pydantic import BaseModel
 from fastapi import UploadFile
 
 from app.models import Segment
+from app.constants import CLONED_VOICES_DIR
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Directory for storing cloned voice data
-CLONED_VOICES_DIR = "/app/cloned_voices"
+# Ensure the cloned voices directory exists
 os.makedirs(CLONED_VOICES_DIR, exist_ok=True)
 
 class ClonedVoice(BaseModel):
@@ -44,8 +44,8 @@ class ClonedVoice(BaseModel):
 class VoiceCloner:
     """Voice cloning utility for CSM-1B model."""
 
-    def __init__(self, generator, device="cuda"):
-        """Initialize the voice cloner with a generator instance."""
+    def __init__(self, generator, device: torch.device):
+        """Initialize the voice cloner with a generator instance and target device."""
         self.generator = generator
         self.device = device
         self.sample_rate = generator.sample_rate

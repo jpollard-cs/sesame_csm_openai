@@ -8,13 +8,10 @@ from typing import Dict, List, Optional, Tuple
 import logging
 from dataclasses import dataclass
 from scipy import signal
+from app.constants import VOICE_REFERENCES_DIR, VOICE_PROFILES_DIR
 
 # Setup logging
 logger = logging.getLogger(__name__)
-
-# Define persistent paths
-VOICE_REFERENCES_DIR = "/app/voice_references"
-VOICE_PROFILES_DIR = "/app/voice_profiles"
 
 # Ensure directories exist
 os.makedirs(VOICE_REFERENCES_DIR, exist_ok=True)
@@ -378,8 +375,9 @@ def create_voice_segments(app_state, regenerate: bool = False):
         regenerate: Whether to regenerate existing references
     """
     generator = app_state.generator
-    if not generator:
-        logger.error("Cannot create voice segments: generator not available")
+    # On MPS, skip reference generation due to incomplete storage allocation support
+    if generator.device.type == 'mps':
+        logger.warning("Skipping voice reference generation on MPS due to known MPS storage allocation issues")
         return
     
     # Use persistent directory for voice reference segments
