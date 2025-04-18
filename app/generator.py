@@ -64,10 +64,11 @@ class Generator:
     def __init__(self, model):
         """Initialize generator with model."""
         self._model = model
+        logger.info(f"Initializing Generator on {next(model.parameters()).device.type} device")
         self._model.setup_caches(1)
         self._text_tokenizer = load_llama3_tokenizer()
         device = next(model.parameters()).device
-        # Load Mimi codec for audio tokenization with CPU fallback
+        # Load Mimi codec for audio tokenization
         logger.info("Loading Mimi audio codec...")
         from huggingface_hub import hf_hub_download
         # Determine Mimi loader
@@ -85,11 +86,14 @@ class Generator:
                 checkpoint = torch.load(checkpoint_path, map_location=device)
                 return MiMiModule.init_from_checkpoint(checkpoint, device=device)
         mimi_weight = hf_hub_download(DEFAULT_REPO, MIMI_NAME)
-        # Try primary device then CPU
-        self._audio_tokenizer = None
+        # Load directly on the model device like the official repo
         self.sample_rate = 24000
+        
+        # First try loading on the model's device (matches official repo)
+        # If that fails (especially on MPS), fall back to CPU (our enhancement)
         for attempt_device in (device, torch.device("cpu")):
             try:
+                # Load Mimi on current attempt device
                 mimi = get_mimi(mimi_weight, device=attempt_device)
                 mimi.set_num_codebooks(32)
                 self._audio_tokenizer = mimi
@@ -97,9 +101,17 @@ class Generator:
                 logger.info(f"Mimi codec loaded successfully with sample rate {self.sample_rate} on {attempt_device}")
                 break
             except Exception as e:
-                logger.error(f"Error loading Mimi codec on {attempt_device}: {e}")
+                logger.warning(f"Loading Mimi codec on {attempt_device} failed: {e}")
+                if attempt_device.type == "cpu":
+                    # If even CPU fails, raise an error
+                    logger.error("Failed to load Mimi codec on both model device and CPU")
+                    raise RuntimeError(f"Failed to load Mimi codec on both {device} and CPU")
+        
+        # Check if we succeeded loading the codec
         if self._audio_tokenizer is None:
-            logger.warning(f"Mimi codec not loaded, using fallback sample rate {self.sample_rate}")
+            logger.error("Audio tokenizer initialization failed completely")
+            raise RuntimeError("Could not initialize Mimi audio codec on any device")
+        
         try:
             self._watermarker = load_watermarker(device=device)
             logger.info("Watermarker loaded successfully")
@@ -108,32 +120,64 @@ class Generator:
             self._watermarker = None
             
         self.device = device
-        # Optimize for CUDA throughput
+        # Standard optimizations by device type
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
-            torch.cuda.empty_cache()
-            logger.info("CUDA optimizations enabled")
-        # Wrap Mimi decode to fallback on CPU for MPS placeholder storage errors
-        elif self._audio_tokenizer is not None:
-            try:
-                orig_decode = self._audio_tokenizer.decode
-                def decode_with_fallback(codes):
-                    try:
-                        return orig_decode(codes)
-                    except RuntimeError as e:
-                        # TODO Probbaly a better way to do this
-                        if self.device.type == 'mps' and 'Placeholder storage' in str(e):
-                            logger.warning("Mimi decode falling back to CPU due to MPS placeholder storage error")
-                            cpu_codes = codes.to('cpu')
-                            self._audio_tokenizer.to('cpu')
-                            audio = orig_decode(cpu_codes)
-                            return audio.to(self.device)
-                        else:
-                            raise
-                self._audio_tokenizer.decode = decode_with_fallback
-            except Exception as e:
-                logger.warning(f"Failed to wrap Mimi decode fallback: {e}")
+            logger.info("CUDA optimizations enabled (benchmark=True)")
+        
+        # Check if tokenizer is on a different device (common with MPS)
+        if self._audio_tokenizer is not None:
+            tokenizer_current_device = next(self._audio_tokenizer.parameters()).device
+            if tokenizer_current_device != self.device:
+                logger.warning(f"Audio tokenizer device ({tokenizer_current_device}) differs from model device ({self.device}). This might happen if Mimi failed to load on MPS.")
+                
+                # Add CPU fallback for decode operations when tokenizer is on a different device
+                self._wrap_decode_with_cpu_fallback()
             
+    def _wrap_decode_with_cpu_fallback(self):
+        """Wrap audio tokenizer decode method with explicit CPU handling for MPS platform.
+        
+        This addresses the issue where the Accelerate library might try to move tensors
+        to MPS when they should stay on CPU for audio codec operations.
+        """
+        if self._audio_tokenizer is None:
+            return
+            
+        orig_decode = self._audio_tokenizer.decode
+        
+        def safe_decode(codes, *args, **kwargs):
+            # Store original ACCELERATE_TORCH_DEVICE value if it exists
+            original_accel_device = os.environ.get("ACCELERATE_TORCH_DEVICE", None)
+            
+            try:
+                # Always perform audio decode on CPU for consistent behavior
+                if self.device.type == "mps":
+                    # Tell accelerate to use CPU for this operation
+                    os.environ["ACCELERATE_TORCH_DEVICE"] = "cpu"
+                    logger.debug("Set ACCELERATE_TORCH_DEVICE=cpu for audio decode")
+                
+                # Move input tensor to CPU
+                cpu_codes = codes.detach().cpu()
+                
+                # Run decode on CPU
+                result = orig_decode(cpu_codes, *args, **kwargs)
+                
+                # Move result back to original device if needed
+                if isinstance(result, torch.Tensor) and self.device.type != "cpu":
+                    result = result.to(self.device)
+                
+                return result
+            finally:
+                # Restore original ACCELERATE_TORCH_DEVICE setting if it existed
+                if original_accel_device is not None:
+                    os.environ["ACCELERATE_TORCH_DEVICE"] = original_accel_device
+                elif "ACCELERATE_TORCH_DEVICE" in os.environ:
+                    del os.environ["ACCELERATE_TORCH_DEVICE"]
+        
+        # Replace the decode method
+        self._audio_tokenizer.decode = safe_decode
+        logger.info("Wrapped audio tokenizer decode method with proactive CPU handling")
+
     def _tokenize_text_segment(self, text: str, speaker: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize a text segment."""
         frame_tokens = []
@@ -159,18 +203,22 @@ class Generator:
             raise RuntimeError("Audio tokenizer not initialized")
         frame_tokens = []
         frame_masks = []
-        # (K, T)
-        # Send audio to the same device as the audio tokenizer (Mimi) to avoid dtype mismatches
+        # Determine the device of the audio tokenizer (might be CPU even if model is on MPS/CUDA)
         try:
             tokenizer_device = next(self._audio_tokenizer.parameters()).device
         except Exception:
             tokenizer_device = self.device
+            
+        # Send audio to the tokenizer's device (which might be CPU for MPS models)
         audio = audio.to(tokenizer_device)
         audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
-        # move tokens to model device for downstream processing before adding EOS
-        audio_tokens = audio_tokens.to(self.device)
+        
+        # Move tokens to model device for further processing
+        if tokenizer_device != self.device:
+            audio_tokens = audio_tokens.to(self.device)
+        
         # add EOS codebook column on model device
-        eos_frame = torch.zeros(audio_tokens.size(0), 1, dtype=audio_tokens.dtype, device=self.device)
+        eos_frame = torch.zeros(audio_tokens.size(0), 1, dtype=torch.long, device=self.device)
         audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
         # build audio frame and mask on model device
         audio_frame = torch.zeros(audio_tokens.size(1), 33, dtype=torch.long, device=self.device)
@@ -509,8 +557,13 @@ class Generator:
             # Decode audio
             audio = self._audio_tokenizer.decode(torch.stack(all_samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
         
+        # Debugging: Temporarily disable enhancement and watermarking
+        debug_skip_postprocessing = os.environ.get("DEBUG_SKIP_POSTPROCESSING", "false").lower() == "true"
+        if debug_skip_postprocessing:
+            logger.warning("DEBUG: Skipping audio enhancement and watermarking")
+        
         # Apply watermark
-        if self._watermarker is not None:
+        if self._watermarker is not None and not debug_skip_postprocessing:
             try:
                 audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
                 audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
@@ -528,7 +581,7 @@ class Generator:
         
         # Calculate real-time factor (RTF)
         rtf = execution_ms / audio_length_ms
-        logger.info(f"Audio generated in {execution_ms:.2f}ms, length: {audio_length_ms:.2f}ms, RTF: {rtf:.2f}x")
+        logger.info(f"Audio generated in {execution_ms:.2f}ms, length: {audio_length_ms:.2f}ms, RTF: {rtf:.2f}x (Post-processing {'skipped' if debug_skip_postprocessing else 'applied'})")
         
         return audio
 
@@ -866,9 +919,9 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", use_gpu: bool = True, device_map: st
         if model is None:
              raise RuntimeError("Model loading failed.")
 
-        # Verify final model device
+        # Verify and log final device
         final_device = next(model.parameters()).device
-        logger.info(f"Model loaded. Final device: {final_device}")
+        logger.info(f"Model loaded successfully. Final device type: {final_device.type}, name: {final_device}")
         if final_device.type != target_device.type:
              logger.warning(f"Model seems to be on {final_device} but target was {target_device}. Attempting final move.")
              model = safely_move_to_device(model, target_device)

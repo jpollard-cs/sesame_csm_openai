@@ -79,29 +79,64 @@ def get_device(use_gpu: Optional[bool] = None) -> torch.device:
     # Ensure MPS fallback is set up
     setup_mps_fallback()
 
+    # Check if MPS is explicitly enabled via environment variable
+    mps_enabled_by_env = os.environ.get("ENABLE_MPS", "false").lower() == "true"
+
     # Detect available devices
     has_cuda, has_mps = detect_available_devices()
 
     # Determine if we should use GPU based on user preference and availability
     if use_gpu is None:
-        use_gpu_device = has_cuda or has_mps  # Auto-detect any GPU
+        # Auto-detect: Prefer CUDA, then MPS (if enabled), then CPU
+        if has_cuda:
+            use_gpu_device = True
+            preferred_device_type = "cuda"
+        elif has_mps and mps_enabled_by_env:
+            use_gpu_device = True
+            preferred_device_type = "mps"
+        else:
+            use_gpu_device = False
+            preferred_device_type = "cpu"
     else:
-        use_gpu_device = use_gpu and (has_cuda or has_mps)
+        # User preference: Only use GPU if requested AND available/enabled
+        if use_gpu:
+            if has_cuda:
+                use_gpu_device = True
+                preferred_device_type = "cuda"
+            elif has_mps and mps_enabled_by_env:
+                use_gpu_device = True
+                preferred_device_type = "mps"
+            else: # User wants GPU but none suitable is available/enabled
+                use_gpu_device = False
+                preferred_device_type = "cpu"
+                logger.warning("GPU requested but CUDA not found and/or MPS not enabled/available. Falling back to CPU.")
+        else: # User explicitly requested CPU
+            use_gpu_device = False
+            preferred_device_type = "cpu"
 
     # Select the appropriate device
     if use_gpu_device:
-        if has_cuda:
+        if preferred_device_type == "cuda":
             device = torch.device("cuda")
             logger.info("Using CUDA GPU")
-        elif has_mps:
+            # Explicitly tell accelerate to use CUDA if it's chosen
+            os.environ["ACCELERATE_TORCH_DEVICE"] = "cuda"
+        elif preferred_device_type == "mps":
             device = torch.device("mps")
             logger.info("Using Apple Metal (MPS) GPU")
+            # Explicitly tell accelerate to use MPS if it's chosen
+            os.environ["ACCELERATE_TORCH_DEVICE"] = "mps"
+            logger.info("Set ACCELERATE_TORCH_DEVICE=mps")
         else:
+            # This case should not happen based on logic above, but fallback just in case
             device = torch.device("cpu")
             logger.info("No compatible GPU found, falling back to CPU")
+            os.environ["ACCELERATE_TORCH_DEVICE"] = "cpu"
     else:
         device = torch.device("cpu")
         logger.info("Using CPU (GPU usage disabled or unavailable)")
+        # Explicitly tell accelerate to use CPU
+        os.environ["ACCELERATE_TORCH_DEVICE"] = "cpu"
 
     return device
 

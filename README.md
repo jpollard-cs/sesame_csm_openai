@@ -456,30 +456,41 @@ Happy speech generating!
 
 If you'd like to run the API natively on an Apple Silicon Mac using PyTorch's MPS backend (no Docker needed), follow these steps:
 
-1. Ensure Homebrew is installed
-2. Install system dependencies:
+1. Create a `.env` file in the /app folder with your Hugging Face token:
+```
+HF_TOKEN=your_hugging_face_token_here
+ENABLE_MPS=true
+```
+
+2. Ensure Homebrew is installed
+3. Install system dependencies:
    ```bash
    brew update
    brew install ffmpeg libsndfile python@3.10
    ```
-3. Install Rust toolchain (required by `moshi`/`sphn`):
+
+4. Install Rust toolchain (required by `moshi`/`sphn`):
    ```bash
    curl https://sh.rustup.rs -sSf | sh -s -- -y
    source $HOME/.cargo/env
    ```
-4. Clone this repository (if you haven't already) and navigate into it:
-5. Create and activate a Python 3.10 virtual environment:
+
+5. Clone this repository (if you haven't already) and navigate into it:
+6. Create and activate a Python 3.10 virtual environment:
    ```bash
    python3.10 -m venv .venv
    source .venv/bin/activate
    ```
-6. Install Python dependencies (via script):
+
+7. Install Python dependencies (via script):
    ```bash
    chmod +x setup_macos.sh
    ./setup_macos.sh
    ```
-7. Start the API server:
+
+8. Start the API server:
    ```bash
    python -m app.main
    ```
-8. The server listens on port 8000. Hit the endpoints at `http://localhost:8000`.
+
+9. The server listens on port 8000. Hit the endpoints at `http://localhost:8000`.
